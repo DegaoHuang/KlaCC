@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 # Filename: train_cv_test_final_with_vis.py
-# Function: 5-fold cross-validation (early stopping by separation) + full training set training + independent test set evaluation + t-SNE/pLOGO visualization
-# Modification: Classifier input = Transformer backbone features (512) + projection features (128) concatenated
+# Function: 5-fold cross-validation + full training + independent test + t-SNE/pLOGO
+# Modification: Classifier input = backbone features(512) + projection features(128)
+#               + Fully reproducible seed + per-fold metrics export
+#               + ★ FIX: Step2 val 用 stratify 划分；compute_separation 去对角线；Stage2 warmup
 
 import torch
 import torch.nn as nn
@@ -18,7 +20,7 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score, matthews_corrcoef,
     average_precision_score, roc_curve, precision_recall_curve
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split   # ★ FIX: 新增 train_test_split
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 import seaborn as sns
@@ -26,6 +28,7 @@ import logomaker
 import argparse
 import os
 import json
+import random
 import pandas as pd
 from datetime import datetime
 import warnings
@@ -37,27 +40,51 @@ print(f"Using device: {DEVICE}")
 
 
 # ====================================================================
+#                    ★ Reproducibility helpers ★
+# ====================================================================
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def make_loader(dataset, batch_size, shuffle, seed, num_workers=0):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        generator=g,
+        worker_init_fn=lambda wid: np.random.seed(seed + wid),
+    )
+
+
+# ====================================================================
 #                    ★ Hyperparameter Management ★
 # ====================================================================
 
 class HyperParams:
     def __init__(self):
-        # ---- Data paths ----
         self.TRAIN_DATA_PATH = './train.xlsx'
         self.TEST_DATA_PATH = './test.xlsx'
         self.AA_EMB_PATH = './aa_embeddings.csv'
         self.SEQ_LENGTH = 51
         self.NUM_CLASSES = 2
 
-        # ---- Column names ----
         self.SEQ_COLUMN = 'protein_sequence'
         self.LABEL_COLUMN = 'label'
         self.POS_COLUMN = 'position'
 
-        # ---- Embeddings ----
         self.ADAPTER_DIM = 512
 
-        # ---- Transformer ----
         self.TRANSFORMER_D_MODEL = 256
         self.TRANSFORMER_NHEAD = 8
         self.TRANSFORMER_LAYERS = 4
@@ -65,17 +92,14 @@ class HyperParams:
         self.POOLING_MODE = 'max'
         self.UNIFIED_DIM = 512
 
-        # ---- Classification head ----
         self.CLASSIFIER_HEAD_DIMS = [128, 64]
         self.CLASSIFIER_HEAD_DROPOUT = 0.1
 
-        # ---- Projection head ----
         self.PROJECTION_HEAD_DIMS = [256, 128]
         self.PROJECTION_OUT_DIM = 128
         self.PROJECTION_HEAD_DROPOUT = 0.1
         self.PROJECTION_USE_BN = True
 
-        # ---- Losses ----
         self.USE_BCE_LOSS = True
         self.NOISE_STD = 0.05
         self.POS_MARGIN = 0.95
@@ -84,12 +108,10 @@ class HyperParams:
         self.NEG_PENALTY = 1.0
         self.SUPCON_TEMPERATURE = 0.02
 
-        # ---- ★★★ Ablation switches ★★★ ----
-        self.USE_STAGE1 = True  # BCE warm-up
-        self.USE_STAGE2 = True  # SupCon
-        self.USE_STAGE3 = True  # End-to-end fine-tuning
+        self.USE_STAGE1 = True
+        self.USE_STAGE2 = True
+        self.USE_STAGE3 = True
 
-        # ---- Training hyperparameters ----
         self.STAGE1_EPOCHS = 1000
         self.STAGE1_BATCH_SIZE = 32
         self.STAGE1_EARLY_STOP = 20
@@ -100,6 +122,7 @@ class HyperParams:
         self.STAGE2_BATCH_SIZE = 2048
         self.STAGE2_EARLY_STOP = 20
         self.STAGE2_LR = 1e-4
+        self.STAGE2_MIN_EPOCHS = 5     # ★ FIX: Stage2 warmup，前 N 轮不参与 best 追踪
 
         self.STAGE3_EPOCHS = 1000
         self.STAGE3_BATCH_SIZE = 32
@@ -107,17 +130,14 @@ class HyperParams:
         self.STAGE3_LR = 1e-4
         self.STAGE3_FREEZE_ENCODER = True
 
-        # ---- Cross-validation ----
         self.N_FOLDS = 5
         self.SEED = 42
 
-        # ---- General ----
         self.VAL_BATCH_SIZE = 128
         self.TEST_BATCH_SIZE = 128
         self.NUM_WORKERS = 4
         self.USE_AMP = True
 
-        # ---- Output ----
         self.OUTPUT_DIR = './experiments/cv_test_final'
         self.SAVE_PLOTS = True
         self.SAVE_MODELS = True
@@ -128,15 +148,15 @@ class HyperParams:
 
     def print_summary(self):
         print("\n" + "=" * 70)
-        print("Experiment configuration (CV for hyperparams + full training + independent test)")
+        print("Experiment configuration (CV + full training + independent test)")
         print("=" * 70)
         print(f"[Training data] {self.TRAIN_DATA_PATH}")
         print(f"[Test data] {self.TEST_DATA_PATH}")
         print(f"[Transformer] d_model={self.TRANSFORMER_D_MODEL}, layers={self.TRANSFORMER_LAYERS}")
-        print(
-            f"[Classifier input] UNIFIED_DIM({self.UNIFIED_DIM}) + PROJECTION_OUT_DIM({self.PROJECTION_OUT_DIM}) = {self.UNIFIED_DIM + self.PROJECTION_OUT_DIM}")
-        print(f"[Ablation switches] Stage1={self.USE_STAGE1}, Stage2={self.USE_STAGE2}, Stage3={self.USE_STAGE3}")
-        print(f"[Cross-validation] Folds={self.N_FOLDS}")
+        print(f"[Classifier input] {self.UNIFIED_DIM} + {self.PROJECTION_OUT_DIM} = {self.UNIFIED_DIM + self.PROJECTION_OUT_DIM}")
+        print(f"[Ablation] Stage1={self.USE_STAGE1}, Stage2={self.USE_STAGE2}, Stage3={self.USE_STAGE3}")
+        print(f"[CV] Folds={self.N_FOLDS}, Seed={self.SEED}")
+        print(f"[Stage2 warmup] {self.STAGE2_MIN_EPOCHS} epochs")
         print(f"[Output] {self.OUTPUT_DIR}")
         print("=" * 70)
 
@@ -253,8 +273,8 @@ class TransformerEncoder(nn.Module):
         local = local + self.pos_embed[:, :local.size(1), :]
         local = self.transformer(local)
         feat = local.mean(dim=1)
-        feat = F.relu(self.fc(feat))  # [batch, UNIFIED_DIM]
-        projection = self.projection(feat)  # [batch, PROJECTION_OUT_DIM]
+        feat = F.relu(self.fc(feat))
+        projection = self.projection(feat)
         if return_projection:
             return feat, projection
         return projection
@@ -266,7 +286,6 @@ class Classifier(nn.Module):
         self.encoder = encoder
         self.use_bce = hp.USE_BCE_LOSS
         output_dim = 1 if self.use_bce else hp.NUM_CLASSES
-        # ★★★ Modification: input dimension = backbone features (512) + projection features (128) ★★★
         input_dim = hp.UNIFIED_DIM + hp.PROJECTION_OUT_DIM
         self.classifier = build_mlp(
             input_dim=input_dim,
@@ -277,9 +296,7 @@ class Classifier(nn.Module):
         )
 
     def forward(self, x, seq_strs=None, return_features=False):
-        # ★★★ Get feat and projection ★★★
         feat, projection = self.encoder(x, seq_strs=seq_strs, return_projection=True)
-        # ★★★ Concatenate ★★★
         combined = torch.cat([feat, projection], dim=1)
         logits = self.classifier(combined)
         if return_features:
@@ -332,11 +349,10 @@ class SupConLoss(nn.Module):
 
 
 # ====================================================================
-# ★ Training and evaluation functions (early stopping, save best model) ★
+# ★ Training functions ★
 # ====================================================================
 
 def train_stage1(model, train_loader, val_loader, hp, device):
-    """Stage 1: BCE warm-up, early stopping, save best model"""
     criterion = nn.BCEWithLogitsLoss() if hp.USE_BCE_LOSS else nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=hp.STAGE1_LR, weight_decay=1e-5)
     best_auc = 0.0
@@ -358,17 +374,13 @@ def train_stage1(model, train_loader, val_loader, hp, device):
                 labels = labels.to(device)
             optimizer.zero_grad()
             logits = model(x, seq_strs=seq_strs)
-            if hp.USE_BCE_LOSS:
-                loss = criterion(logits.squeeze(1), labels.squeeze(1))
-            else:
-                loss = criterion(logits, labels)
+            loss = criterion(logits.squeeze(1), labels.squeeze(1)) if hp.USE_BCE_LOSS else criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
         val_metrics, _, _, _, _ = evaluate(model, val_loader, criterion, device, hp)
-        print(
-            f"  Stage1 Epoch {epoch + 1}: Loss={total_loss / len(train_loader):.4f}, Val AUC={val_metrics['auc']:.4f}")
+        print(f"  Stage1 Epoch {epoch + 1}: Loss={total_loss / len(train_loader):.4f}, Val AUC={val_metrics['auc']:.4f}")
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
             patience = 0
@@ -384,7 +396,7 @@ def train_stage1(model, train_loader, val_loader, hp, device):
 
 
 def train_stage2(encoder, train_loader, val_loader, hp, device):
-    """Stage 2: SupCon pre-training, early stopping by separation, save best encoder"""
+    """Stage 2: SupCon pre-training with warmup (skip first N epochs for best tracking)."""
     supcon_loss = SupConLoss(
         temperature=hp.SUPCON_TEMPERATURE,
         pos_margin=hp.POS_MARGIN, neg_margin=hp.NEG_MARGIN,
@@ -395,6 +407,10 @@ def train_stage2(encoder, train_loader, val_loader, hp, device):
     best_sep = -float('inf')
     patience = 0
     best_state = None
+
+    # ★ FIX: warmup，前 STAGE2_MIN_EPOCHS 轮不参与 best 追踪
+    warmup_epochs = getattr(hp, 'STAGE2_MIN_EPOCHS', 5)
+
     for epoch in range(hp.STAGE2_EPOCHS):
         encoder.train()
         total_loss = 0
@@ -415,7 +431,15 @@ def train_stage2(encoder, train_loader, val_loader, hp, device):
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader)
         sep, pos_sim, neg_sim = compute_separation(encoder, val_loader, device)
-        print(f"  Stage2 Epoch {epoch + 1}: Loss={avg_loss:.4f}, Separation={sep:.4f}")
+
+        # ★ FIX: warmup 期间只打印，不更新 best / patience
+        if epoch + 1 < warmup_epochs:
+            print(f"  Stage2 Epoch {epoch + 1}: Loss={avg_loss:.4f}, Separation={sep:.4f} "
+                  f"(warmup, pos={pos_sim:.4f}, neg={neg_sim:.4f})")
+            continue
+
+        print(f"  Stage2 Epoch {epoch + 1}: Loss={avg_loss:.4f}, Separation={sep:.4f} "
+              f"(pos={pos_sim:.4f}, neg={neg_sim:.4f})")
         if sep > best_sep:
             best_sep = sep
             patience = 0
@@ -433,7 +457,6 @@ def train_stage2(encoder, train_loader, val_loader, hp, device):
 
 
 def train_stage3(model, train_loader, val_loader, hp, device):
-    """Stage 3: End-to-end fine-tuning, early stopping, save best model"""
     criterion = nn.BCEWithLogitsLoss() if hp.USE_BCE_LOSS else nn.CrossEntropyLoss()
     if hp.STAGE3_FREEZE_ENCODER:
         for param in model.encoder.parameters():
@@ -459,17 +482,13 @@ def train_stage3(model, train_loader, val_loader, hp, device):
                 labels = labels.to(device)
             optimizer.zero_grad()
             logits = model(x, seq_strs=seq_strs)
-            if hp.USE_BCE_LOSS:
-                loss = criterion(logits.squeeze(1), labels.squeeze(1))
-            else:
-                loss = criterion(logits, labels)
+            loss = criterion(logits.squeeze(1), labels.squeeze(1)) if hp.USE_BCE_LOSS else criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
         val_metrics, _, _, _, _ = evaluate(model, val_loader, criterion, device, hp)
-        print(
-            f"  Stage3 Epoch {epoch + 1}: Loss={total_loss / len(train_loader):.4f}, Val AUC={val_metrics['auc']:.4f}")
+        print(f"  Stage3 Epoch {epoch + 1}: Loss={total_loss / len(train_loader):.4f}, Val AUC={val_metrics['auc']:.4f}")
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
             patience = 0
@@ -499,10 +518,7 @@ def evaluate(model, dataloader, criterion, device, hp):
                 seq_strs = None
             x = x.to(device)
             labels_orig = labels.cpu().numpy()
-            if hp.USE_BCE_LOSS:
-                labels_f = labels.float().unsqueeze(1).to(device)
-            else:
-                labels_f = labels.to(device)
+            labels_f = labels.float().unsqueeze(1).to(device) if hp.USE_BCE_LOSS else labels.to(device)
             logits, features = model(x, seq_strs=seq_strs, return_features=True)
             if hp.USE_BCE_LOSS:
                 loss = criterion(logits.squeeze(1), labels_f.squeeze(1))
@@ -526,6 +542,7 @@ def evaluate(model, dataloader, criterion, device, hp):
 
 
 def compute_separation(encoder, dataloader, device, num_samples=2000):
+    """★ FIX: 排除对角线（自己与自己相似度=1），避免 separation 虚高。"""
     encoder.eval()
     all_proj, all_labels = [], []
     with torch.no_grad():
@@ -550,13 +567,24 @@ def compute_separation(encoder, dataloader, device, num_samples=2000):
         return 0.0, 0.0, 0.0
     proj = all_proj[mask]
     lab = all_labels[mask]
+
+    # ★ FIX 核心：如果验证集只有单一类别，separation 无意义，直接返回 0
+    unique_labels = np.unique(lab)
+    if len(unique_labels) < 2:
+        return 0.0, 0.0, 0.0
+
     proj_t = torch.tensor(proj, dtype=torch.float32)
     lab_t = torch.tensor(lab, dtype=torch.long)
     sim = F.cosine_similarity(proj_t.unsqueeze(1), proj_t.unsqueeze(0), dim=2)
-    pos_mask = torch.eq(lab_t.unsqueeze(1), lab_t.unsqueeze(0))
-    neg_mask = ~pos_mask
-    pos_sim = sim[pos_mask].mean().item() if pos_mask.sum() > 0 else 0
-    neg_sim = sim[neg_mask].mean().item() if neg_mask.sum() > 0 else 0
+
+    # ★ FIX: 排除对角线，pos_mask 不再包含自己与自己
+    eye = torch.eye(len(lab), dtype=torch.bool, device=sim.device)
+    same_label = torch.eq(lab_t.unsqueeze(1), lab_t.unsqueeze(0))
+    pos_mask = same_label & (~eye)
+    neg_mask = (~same_label) & (~eye)
+
+    pos_sim = sim[pos_mask].mean().item() if pos_mask.sum() > 0 else 0.0
+    neg_sim = sim[neg_mask].mean().item() if neg_mask.sum() > 0 else 0.0
     return pos_sim - neg_sim, pos_sim, neg_sim
 
 
@@ -603,9 +631,7 @@ def load_data_from_xlsx(data_path, seq_col, label_col, pos_col, seq_length,
 
 def perform_tsne_and_clustering(encoder, dataloader, device, hp, n_clusters=4, random_state=42):
     encoder.eval()
-    all_feats = []
-    all_labels = []
-    all_seqs = []
+    all_feats, all_labels, all_seqs = [], [], []
     with torch.no_grad():
         for batch in dataloader:
             if len(batch) == 3:
@@ -642,8 +668,7 @@ def draw_sequence_logo(seqs, output_path, title='Sequence Logo', max_len=None):
         seq = seq[:max_len]
         for pos, aa in enumerate(seq):
             if aa in aa_list:
-                idx = aa_list.index(aa)
-                counts[pos, idx] += 1
+                counts[pos, aa_list.index(aa)] += 1
     df = pd.DataFrame(counts, columns=aa_list)
     df = df.div(df.sum(axis=1), axis=0)
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -663,43 +688,37 @@ def draw_sequence_logo(seqs, output_path, title='Sequence Logo', max_len=None):
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='CV hyperparam selection + full training + independent test + visualization')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--train_path', type=str, default=None)
     parser.add_argument('--test_path', type=str, default=None)
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--n_folds', type=int, default=5)
+    parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--no_stage1', action='store_true')
     parser.add_argument('--no_stage2', action='store_true')
     parser.add_argument('--no_stage3', action='store_true')
     args = parser.parse_args()
 
     hp = HyperParams()
-    if args.train_path:
-        hp.TRAIN_DATA_PATH = args.train_path
-    if args.test_path:
-        hp.TEST_DATA_PATH = args.test_path
-    if args.output_dir:
-        hp.OUTPUT_DIR = args.output_dir
-    if args.n_folds:
-        hp.N_FOLDS = args.n_folds
-    if args.no_stage1:
-        hp.USE_STAGE1 = False
-    if args.no_stage2:
-        hp.USE_STAGE2 = False
-    if args.no_stage3:
-        hp.USE_STAGE3 = False
+    if args.train_path: hp.TRAIN_DATA_PATH = args.train_path
+    if args.test_path: hp.TEST_DATA_PATH = args.test_path
+    if args.output_dir: hp.OUTPUT_DIR = args.output_dir
+    if args.n_folds: hp.N_FOLDS = args.n_folds
+    if args.seed is not None: hp.SEED = args.seed
+    if args.no_stage1: hp.USE_STAGE1 = False
+    if args.no_stage2: hp.USE_STAGE2 = False
+    if args.no_stage3: hp.USE_STAGE3 = False
 
     hp.print_summary()
-    np.random.seed(hp.SEED)
-    torch.manual_seed(hp.SEED)
+    seed_everything(hp.SEED)
+
     os.makedirs(hp.OUTPUT_DIR, exist_ok=True)
     plots_dir = os.path.join(hp.OUTPUT_DIR, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
     with open(os.path.join(hp.OUTPUT_DIR, 'config.json'), 'w') as f:
         json.dump(hp.to_dict(), f, indent=2)
 
-    # ---- Load training and test data ----
+    # ---- Load data ----
     print("\n🔍 Loading data...")
     aa_to_idx, pretrained_embeddings = load_aa_embeddings(hp.AA_EMB_PATH)
     train_sequences, train_labels = load_data_from_xlsx(
@@ -711,14 +730,21 @@ def main():
     print(f"Training set: {len(train_sequences)} samples")
     print(f"Test set: {len(test_sequences)} samples")
 
+    # ★ FIX: 打印标签分布，方便诊断
+    print(f"[DIAG] train label distribution: {np.bincount(np.array(train_labels))}")
+    print(f"[DIAG] test  label distribution: {np.bincount(np.array(test_labels))}")
+
     # ---- Step 1: 5-fold cross-validation ----
     print("\n" + "=" * 70)
-    print("Step 1: 5-fold cross-validation (select best hyperparameter configuration)")
+    print("Step 1: 5-fold cross-validation")
     print("=" * 70)
 
     skf = StratifiedKFold(n_splits=hp.N_FOLDS, shuffle=True, random_state=hp.SEED)
     fold_aucs = []
+    fold_metrics_list = []
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(train_sequences, train_labels)):
+        seed_everything(hp.SEED + fold)
         print(f"\nFold {fold + 1}/{hp.N_FOLDS}")
         train_seq_fold = [train_sequences[i] for i in train_idx]
         train_lab_fold = [train_labels[i] for i in train_idx]
@@ -727,8 +753,8 @@ def main():
 
         train_dataset = AAIndexDataset(train_seq_fold, train_lab_fold, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
         val_dataset = AAIndexDataset(val_seq_fold, val_lab_fold, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
-        train_loader = DataLoader(train_dataset, batch_size=hp.STAGE1_BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=hp.VAL_BATCH_SIZE, shuffle=False)
+        train_loader = make_loader(train_dataset, hp.STAGE1_BATCH_SIZE, True, hp.SEED + fold, hp.NUM_WORKERS)
+        val_loader = make_loader(val_dataset, hp.VAL_BATCH_SIZE, False, hp.SEED + fold, hp.NUM_WORKERS)
 
         encoder = TransformerEncoder(hp).to(DEVICE)
         model = Classifier(encoder, hp).to(DEVICE)
@@ -750,9 +776,18 @@ def main():
             model, val_loader, nn.BCEWithLogitsLoss(), DEVICE, hp
         )
         fold_aucs.append(val_metrics['auc'])
-        print(f"  Fold {fold + 1} validation AUC: {val_metrics['auc']:.4f}")
+        fold_metrics_list.append({
+            'Fold': fold + 1,
+            'Acc': val_metrics['acc'], 'Rec': val_metrics['recall'],
+            'Pre': val_metrics['precision'], 'MCC': val_metrics['mcc'],
+            'F1': val_metrics['f1'], 'AUC': val_metrics['auc'],
+            'AUCPR': val_metrics['auprc'], 'Sp': val_metrics['specificity'],
+        })
+        print(f"  Fold {fold + 1}: AUC={val_metrics['auc']:.4f}  Acc={val_metrics['acc']:.4f}  "
+              f"Rec={val_metrics['recall']:.4f}  Pre={val_metrics['precision']:.4f}  "
+              f"F1={val_metrics['f1']:.4f}  MCC={val_metrics['mcc']:.4f}  "
+              f"AUCPR={val_metrics['auprc']:.4f}  Sp={val_metrics['specificity']:.4f}")
 
-        # Plot ROC/PR for this fold
         if hp.SAVE_PLOTS:
             fold_plot_dir = os.path.join(plots_dir, f'fold_{fold + 1}')
             os.makedirs(fold_plot_dir, exist_ok=True)
@@ -760,51 +795,84 @@ def main():
             plt.figure(figsize=(6, 5))
             plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {val_metrics["auc"]:.4f})')
             plt.plot([0, 1], [0, 1], 'k--', lw=1)
-            plt.xlim([0, 1]);
-            plt.ylim([0, 1.05])
-            plt.xlabel('False Positive Rate');
-            plt.ylabel('True Positive Rate')
+            plt.xlim([0, 1]); plt.ylim([0, 1.05])
+            plt.xlabel('FPR'); plt.ylabel('TPR')
             plt.title(f'ROC - Fold {fold + 1}')
-            plt.legend(loc='lower right');
-            plt.grid(alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(fold_plot_dir, 'roc_curve.png'), dpi=300)
-            plt.close()
+            plt.legend(loc='lower right'); plt.grid(alpha=0.3)
+            plt.tight_layout(); plt.savefig(os.path.join(fold_plot_dir, 'roc_curve.png'), dpi=300); plt.close()
+
             precision, recall, _ = precision_recall_curve(val_labels_np, val_probs)
             plt.figure(figsize=(6, 5))
             plt.plot(recall, precision, color='green', lw=2, label=f'PR (AUPRC = {val_metrics["auprc"]:.4f})')
-            plt.xlim([0, 1]);
-            plt.ylim([0, 1.05])
-            plt.xlabel('Recall');
-            plt.ylabel('Precision')
+            plt.xlim([0, 1]); plt.ylim([0, 1.05])
+            plt.xlabel('Recall'); plt.ylabel('Precision')
             plt.title(f'Precision-Recall - Fold {fold + 1}')
-            plt.legend(loc='lower left');
-            plt.grid(alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(fold_plot_dir, 'pr_curve.png'), dpi=300)
-            plt.close()
+            plt.legend(loc='lower left'); plt.grid(alpha=0.3)
+            plt.tight_layout(); plt.savefig(os.path.join(fold_plot_dir, 'pr_curve.png'), dpi=300); plt.close()
 
+    # ---- CV summary ----
     mean_auc = np.mean(fold_aucs)
     std_auc = np.std(fold_aucs)
-    print(f"\nCV results: mean AUC = {mean_auc:.4f} ± {std_auc:.4f}")
-    cv_results = {'fold_aucs': fold_aucs, 'mean_auc': mean_auc, 'std_auc': std_auc}
+    fold_df = pd.DataFrame(fold_metrics_list)
+    metric_cols = ['Acc', 'Rec', 'Pre', 'MCC', 'F1', 'AUC', 'AUCPR', 'Sp']
+
+    print("\n" + "=" * 100)
+    print("Per-fold CV metrics")
+    print("=" * 100)
+    print(fold_df[['Fold'] + metric_cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    summary_rows = []
+    for col in metric_cols:
+        vals = fold_df[col].values
+        summary_rows.append({
+            'Metric': col, 'Mean': float(np.mean(vals)), 'Std': float(np.std(vals)),
+            'Mean±Std': f"{np.mean(vals):.4f} ± {np.std(vals):.4f}",
+        })
+    summary_df = pd.DataFrame(summary_rows)
+    print("\n" + "=" * 100)
+    print("CV summary (mean ± std over folds)")
+    print("=" * 100)
+    print(summary_df[['Metric', 'Mean±Std']].to_string(index=False))
+
+    fold_df.to_csv(os.path.join(hp.OUTPUT_DIR, 'cv_fold_metrics.csv'), index=False)
+    summary_df.to_csv(os.path.join(hp.OUTPUT_DIR, 'cv_summary_metrics.csv'), index=False)
+    cv_results = {
+        'fold_aucs': fold_aucs, 'mean_auc': mean_auc, 'std_auc': std_auc,
+        'fold_metrics': fold_metrics_list, 'summary_metrics': summary_rows,
+    }
     with open(os.path.join(hp.OUTPUT_DIR, 'cv_results.json'), 'w') as f:
         json.dump(cv_results, f, indent=2)
 
+    # ====================================================================
     # ---- Step 2: Train final model on full training set ----
+    # ★★★ FIX 核心：用 train_test_split(stratify=...) 替代 [-val_size:] ★★★
+    # ====================================================================
     print("\n" + "=" * 70)
-    print("Step 2: Train final model on full training set (using the same ablation configuration)")
+    print("Step 2: Train final model on full training set")
     print("=" * 70)
 
-    val_size = int(0.1 * len(train_sequences))
-    val_seq_full = train_sequences[-val_size:]
-    val_lab_full = train_labels[-val_size:]
-    train_seq_full = train_sequences[:-val_size]
-    train_lab_full = train_labels[:-val_size]
+    seed_everything(hp.SEED)
+
+    # ★ FIX: 分层划分，保证 val 集正负样本都存在
+    train_seq_full, val_seq_full, train_lab_full, val_lab_full = train_test_split(
+        train_sequences, train_labels,
+        test_size=0.1,
+        stratify=train_labels,
+        random_state=hp.SEED,
+    )
+    print(f"[DIAG] Step2 train label distribution: {np.bincount(np.array(train_lab_full))}")
+    print(f"[DIAG] Step2 val   label distribution: {np.bincount(np.array(val_lab_full))}")
+
+    if len(np.unique(val_lab_full)) < 2:
+        raise RuntimeError(
+            "Step2 val 集只有单一类别！请检查 train.xlsx 的 label 分布，"
+            "或调整 stratify / test_size 参数。"
+        )
+
     train_dataset_full = AAIndexDataset(train_seq_full, train_lab_full, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
     val_dataset_full = AAIndexDataset(val_seq_full, val_lab_full, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
-    train_loader_full = DataLoader(train_dataset_full, batch_size=hp.STAGE1_BATCH_SIZE, shuffle=True)
-    val_loader_full = DataLoader(val_dataset_full, batch_size=hp.VAL_BATCH_SIZE, shuffle=False)
+    train_loader_full = make_loader(train_dataset_full, hp.STAGE1_BATCH_SIZE, True, hp.SEED, hp.NUM_WORKERS)
+    val_loader_full = make_loader(val_dataset_full, hp.VAL_BATCH_SIZE, False, hp.SEED, hp.NUM_WORKERS)
 
     encoder_final = TransformerEncoder(hp).to(DEVICE)
     model_final = Classifier(encoder_final, hp).to(DEVICE)
@@ -827,27 +895,26 @@ def main():
         torch.save(encoder_final.state_dict(), os.path.join(hp.OUTPUT_DIR, 'final_encoder.pth'))
         print("✅ Final model saved")
 
-    # ---- Step 3: Independent test set evaluation ----
+    # ---- Step 3: Independent test ----
     print("\n" + "=" * 70)
-    print("Step 3: Evaluate final model on independent test set (final ablation results)")
+    print("Step 3: Evaluate final model on independent test set")
     print("=" * 70)
 
     test_dataset = AAIndexDataset(test_sequences, test_labels, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
-    test_loader = DataLoader(test_dataset, batch_size=hp.TEST_BATCH_SIZE, shuffle=False)
+    test_loader = make_loader(test_dataset, hp.TEST_BATCH_SIZE, False, hp.SEED, hp.NUM_WORKERS)
 
     test_metrics, test_features, test_labels_np, test_preds, test_probs = evaluate(
         model_final, test_loader, nn.BCEWithLogitsLoss(), DEVICE, hp
     )
 
-    print("\nTest set metrics (final ablation results):")
+    print("\nTest set metrics:")
     for k, v in test_metrics.items():
         if k != 'loss':
             print(f"  {k.upper()}: {v:.4f}")
 
     test_results = {
         'test_metrics': test_metrics,
-        'cv_mean_auc': mean_auc,
-        'cv_std_auc': std_auc,
+        'cv_mean_auc': mean_auc, 'cv_std_auc': std_auc,
         'config': hp.to_dict(),
         'timestamp': datetime.now().isoformat()
     }
@@ -856,78 +923,51 @@ def main():
 
     # ---- Visualization ----
     if hp.SAVE_PLOTS:
-        # CV bar chart
         plt.figure(figsize=(8, 5))
         plt.bar(range(1, hp.N_FOLDS + 1), fold_aucs, color='skyblue', edgecolor='navy')
         plt.axhline(y=mean_auc, color='r', linestyle='--', label=f'Mean={mean_auc:.4f}')
-        plt.xlabel('Fold');
-        plt.ylabel('Validation AUC');
-        plt.title('Cross-Validation AUC')
-        plt.legend();
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'cv_auc_bars.png'), dpi=300);
-        plt.close()
+        plt.xlabel('Fold'); plt.ylabel('Validation AUC'); plt.title('Cross-Validation AUC')
+        plt.legend(); plt.tight_layout(); plt.savefig(os.path.join(plots_dir, 'cv_auc_bars.png'), dpi=300); plt.close()
 
-        # Confusion matrix
         cm = confusion_matrix(test_labels_np, test_preds)
         plt.figure(figsize=(6, 5))
-        plt.imshow(cm, cmap='Blues', interpolation='nearest')
-        plt.colorbar()
-        plt.xticks([0, 1], ['Negative', 'Positive'])
-        plt.yticks([0, 1], ['Negative', 'Positive'])
+        plt.imshow(cm, cmap='Blues', interpolation='nearest'); plt.colorbar()
+        plt.xticks([0, 1], ['Negative', 'Positive']); plt.yticks([0, 1], ['Negative', 'Positive'])
         for i in range(2):
             for j in range(2):
                 plt.text(j, i, str(cm[i, j]), ha='center', va='center')
-        plt.title('Confusion Matrix (Test Set)')
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'confusion_matrix_test.png'), dpi=300);
-        plt.close()
+        plt.title('Confusion Matrix (Test)'); plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'confusion_matrix_test.png'), dpi=300); plt.close()
 
-        # Test set ROC/PR
         fpr, tpr, _ = roc_curve(test_labels_np, test_probs)
         plt.figure(figsize=(6, 5))
         plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {test_metrics["auc"]:.4f})')
         plt.plot([0, 1], [0, 1], 'k--', lw=1)
-        plt.xlim([0, 1]);
-        plt.ylim([0, 1.05])
-        plt.xlabel('False Positive Rate');
-        plt.ylabel('True Positive Rate')
-        plt.title('ROC - Test Set')
-        plt.legend(loc='lower right');
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'roc_curve_test.png'), dpi=300);
-        plt.close()
+        plt.xlim([0, 1]); plt.ylim([0, 1.05])
+        plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC - Test Set')
+        plt.legend(loc='lower right'); plt.grid(alpha=0.3); plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'roc_curve_test.png'), dpi=300); plt.close()
 
         precision, recall, _ = precision_recall_curve(test_labels_np, test_probs)
         plt.figure(figsize=(6, 5))
         plt.plot(recall, precision, color='green', lw=2, label=f'PR (AUPRC = {test_metrics["auprc"]:.4f})')
-        plt.xlim([0, 1]);
-        plt.ylim([0, 1.05])
-        plt.xlabel('Recall');
-        plt.ylabel('Precision')
-        plt.title('Precision-Recall - Test Set')
-        plt.legend(loc='lower left');
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'pr_curve_test.png'), dpi=300);
-        plt.close()
+        plt.xlim([0, 1]); plt.ylim([0, 1.05])
+        plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('PR - Test Set')
+        plt.legend(loc='lower left'); plt.grid(alpha=0.3); plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'pr_curve_test.png'), dpi=300); plt.close()
 
-        # t-SNE and pLOGO
-        print("\n🔬 Generating t-SNE clustering plots and sequence logos...")
+        print("\n🔬 Generating t-SNE and sequence logos...")
         all_seqs_for_tsne = train_sequences + test_sequences
         all_labels_for_tsne = train_labels + test_labels
-        combined_dataset = AAIndexDataset(all_seqs_for_tsne, all_labels_for_tsne, aa_to_idx, hp.SEQ_LENGTH,
-                                          return_str=True)
-        combined_loader = DataLoader(combined_dataset, batch_size=hp.TEST_BATCH_SIZE, shuffle=False)
+        combined_dataset = AAIndexDataset(all_seqs_for_tsne, all_labels_for_tsne, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
+        combined_loader = make_loader(combined_dataset, hp.TEST_BATCH_SIZE, False, hp.SEED, hp.NUM_WORKERS)
 
         if len(all_seqs_for_tsne) > 5000:
-            print(f"  Large number of samples ({len(all_seqs_for_tsne)}), randomly sampling 5000 for t-SNE")
             indices = np.random.choice(len(all_seqs_for_tsne), 5000, replace=False)
             sampled_seqs = [all_seqs_for_tsne[i] for i in indices]
             sampled_labels = [all_labels_for_tsne[i] for i in indices]
             sampled_dataset = AAIndexDataset(sampled_seqs, sampled_labels, aa_to_idx, hp.SEQ_LENGTH, return_str=True)
-            combined_loader = DataLoader(sampled_dataset, batch_size=hp.TEST_BATCH_SIZE, shuffle=False)
+            combined_loader = make_loader(sampled_dataset, hp.TEST_BATCH_SIZE, False, hp.SEED, hp.NUM_WORKERS)
 
         n_clusters = 4
         feats, true_labels, tsne_coords, cluster_labels, seqs = perform_tsne_and_clustering(
@@ -936,23 +976,15 @@ def main():
 
         plt.figure(figsize=(10, 8))
         sns.scatterplot(x=tsne_coords[:, 0], y=tsne_coords[:, 1], hue=true_labels, palette='Set1', alpha=0.7)
-        plt.title('t-SNE by True Label');
-        plt.xlabel('t-SNE 1');
-        plt.ylabel('t-SNE 2')
-        plt.legend(title='Label');
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'tsne_by_true_label.png'), dpi=300);
-        plt.close()
+        plt.title('t-SNE by True Label'); plt.xlabel('t-SNE 1'); plt.ylabel('t-SNE 2')
+        plt.legend(title='Label'); plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'tsne_by_true_label.png'), dpi=300); plt.close()
 
         plt.figure(figsize=(10, 8))
         sns.scatterplot(x=tsne_coords[:, 0], y=tsne_coords[:, 1], hue=cluster_labels, palette='tab10', alpha=0.7)
-        plt.title('t-SNE by KMeans Cluster');
-        plt.xlabel('t-SNE 1');
-        plt.ylabel('t-SNE 2')
-        plt.legend(title='Cluster');
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, 'tsne_by_cluster.png'), dpi=300);
-        plt.close()
+        plt.title('t-SNE by KMeans Cluster'); plt.xlabel('t-SNE 1'); plt.ylabel('t-SNE 2')
+        plt.legend(title='Cluster'); plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'tsne_by_cluster.png'), dpi=300); plt.close()
 
         cluster_seqs = {i: [] for i in range(n_clusters)}
         for seq, c in zip(seqs, cluster_labels):
@@ -963,21 +995,18 @@ def main():
             if len(seq_list) < 3:
                 print(f"  Cluster {c} has too few samples ({len(seq_list)}), skipping logo")
                 continue
-            title = f'Cluster {c} Logo (n={len(seq_list)})'
-            out_path = os.path.join(logo_dir, f'cluster_{c}_logo.png')
-            draw_sequence_logo(seq_list, out_path, title=title, max_len=hp.SEQ_LENGTH)
-            print(f"  Cluster {c} logo saved: {out_path}")
+            draw_sequence_logo(seq_list, os.path.join(logo_dir, f'cluster_{c}_logo.png'),
+                               title=f'Cluster {c} Logo (n={len(seq_list)})', max_len=hp.SEQ_LENGTH)
+
         for label in [0, 1]:
             label_seqs = [seq for seq, lab in zip(seqs, true_labels) if lab == label]
             if len(label_seqs) > 3:
-                title = f'Label {label} Logo (n={len(label_seqs)})'
-                out_path = os.path.join(logo_dir, f'label_{label}_logo.png')
-                draw_sequence_logo(label_seqs, out_path, title=title, max_len=hp.SEQ_LENGTH)
+                draw_sequence_logo(label_seqs, os.path.join(logo_dir, f'label_{label}_logo.png'),
+                                   title=f'Label {label} Logo (n={len(label_seqs)})', max_len=hp.SEQ_LENGTH)
 
     print("\n" + "=" * 70)
     print(f"✅ All done! Results saved to: {hp.OUTPUT_DIR}")
-    print(f"Ablation configuration: Stage1={hp.USE_STAGE1}, Stage2={hp.USE_STAGE2}, Stage3={hp.USE_STAGE3}")
-    print(f"Classifier input dimension: {hp.UNIFIED_DIM + hp.PROJECTION_OUT_DIM}")
+    print(f"Ablation: Stage1={hp.USE_STAGE1}, Stage2={hp.USE_STAGE2}, Stage3={hp.USE_STAGE3}")
     print(f"CV mean AUC: {mean_auc:.4f} ± {std_auc:.4f}")
     print(f"Test set AUC: {test_metrics['auc']:.4f}")
     print("=" * 70)
