@@ -131,7 +131,7 @@ class HyperParams:
         self.STAGE3_FREEZE_ENCODER = True
 
         self.N_FOLDS = 5
-        self.SEED = 42
+        self.SEED = 123
 
         self.VAL_BATCH_SIZE = 128
         self.TEST_BATCH_SIZE = 128
